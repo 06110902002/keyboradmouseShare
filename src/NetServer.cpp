@@ -5,6 +5,7 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -12,6 +13,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <string>
 
 #include "Log.h"
 
@@ -28,6 +30,23 @@ bool setNonBlocking(int fd) {
 void setSockOpt1(int fd, int level, int opt) {
     int one = 1;
     ::setsockopt(fd, level, opt, &one, sizeof(one));
+}
+// 获取本机对外 IPv4 地址(第一个非回环地址)。找不到时返回空串。
+std::string localIPv4() {
+    std::string ip;
+    ifaddrs *ifap = nullptr;
+    if (::getifaddrs(&ifap) != 0) return ip;
+    for (ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        auto *sin = reinterpret_cast<sockaddr_in *>(ifa->ifa_addr);
+        char buf[INET_ADDRSTRLEN] = {0};
+        ::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+        if (std::string(buf).rfind("127.", 0) == 0) continue; // 跳过回环地址
+        ip = buf;
+        break;
+    }
+    ::freeifaddrs(ifap);
+    return ip;
 }
 } // namespace
 
@@ -82,7 +101,9 @@ bool NetServer::start() {
     listenSrc_ = CFSocketCreateRunLoopSource(kCFAllocatorDefault, listenSock_, 0);
     CFRunLoopAddSource(CFRunLoopGetCurrent(), listenSrc_, kCFRunLoopCommonModes);
 
-    KMS_INFO("正在监听 0.0.0.0:%d,等待客户端连接…", port_);
+    const std::string localIP = localIPv4();
+    KMS_INFO("正在监听 %s:%d,等待客户端连接…",
+             localIP.empty() ? "0.0.0.0" : localIP.c_str(), port_);
     return true;
 }
 

@@ -3,6 +3,9 @@
 // =============================================================================
 #include "MacCapture.h"
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
+
 #include "Log.h"
 
 namespace kms {
@@ -11,6 +14,9 @@ MacCapture::~MacCapture() { stop(); }
 
 // -----------------------------------------------------------------------------
 // 辅助功能授权检查。CGEventTap 采集全局键鼠需要"辅助功能"权限。
+// 1. AXIsProcessTrusted():只查询当前进程是否已被授权,不弹窗。
+// 2. 未授权且 prompt == true 时,通过 AXIsProcessTrustedWithOptions + kAXTrustedCheckOptionPrompt 主动调起系统授权引导(系统设置 → 隐私与安全性 → 辅助功能)。
+// 3. 授权是静态的,所以在 main.mm 启动流程里最先调用,失败就直接退出并提示。
 // -----------------------------------------------------------------------------
 bool MacCapture::ensureAccessibility(bool prompt) {
     if (AXIsProcessTrusted()) return true;
@@ -209,21 +215,55 @@ CGEventRef MacCapture::handleEvent(CGEventType type, CGEventRef event) {
 // 因此快甩也不会被屏幕边界"钳住"归零(这正是相对模式可达任意位置的关键)。
 // 注意:不做 warp-to-center —— 解耦后无需靠居中防边界,且 warp 可能产生一次
 // 虚假大 delta 导致进入瞬间跳一下。
+//
+// 隐藏光标的坑:CGDisplayHideCursor 主要对"前台应用"生效,而本程序是纯命令行
+// 后台进程,直接调用会被系统忽略(表现为光标依旧可见)。因此必须先通过
+// WindowServer 私有接口声明"可在后台操作光标"(SetsCursorInBackground),
+// 再调用 CGDisplayHideCursor 才会真正隐藏。
 // -----------------------------------------------------------------------------
+// 设置/清除 "SetsCursorInBackground" 连接属性,授予后台进程操作光标的资格。
+// 私有符号用 dlopen/dlsym 运行时加载:系统改版或符号缺失时静默降级(保持旧行为)。
+static void setCursorHideInBackground(bool enable) {
+    static void *handle = dlopen(
+        "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) return;
+    using MainConnFn = int (*)();
+    using SetPropFn = int (*)(int, int, CFStringRef, CFTypeRef);
+    auto mainConn = reinterpret_cast<MainConnFn>(dlsym(handle, "CGSMainConnectionID"));
+    auto setProp = reinterpret_cast<SetPropFn>(dlsym(handle, "CGSSetConnectionProperty"));
+    if (!mainConn || !setProp) return;
+    const int cid = mainConn();
+    setProp(cid, cid, CFSTR("SetsCursorInBackground"),
+            enable ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
 void MacCapture::beginRemoteCursor() {
     CGEventRef e = CGEventCreate(nullptr);
     savedCursor_ = CGEventGetLocation(e);
     CFRelease(e);
 
+    // 关键:后台进程先取得"后台操作光标"资格,否则下面的隐藏会被系统忽略。
+    setCursorHideInBackground(true);
+    /**
+     * CGAssociateMouseAndMouseCursorPosition(bool associate) 是 macOS CoreGraphics 的光标解耦开关,用于把"物理鼠标移动"和"系统光标位置"之间的联动关系切断或恢复
+     * 参数 true:正常模式。鼠标怎么动,系统光标就跟着怎么动(默认状态)。
+     * 参数 false:解耦模式。鼠标移动不再驱动系统光标的位置,但操作系统仍然能感知到鼠标在动,并且能通过事件读到移动增量。
+     * 在这个项目里为什么必须用
+     * MacCapture.mm 的次屏态(控制安卓)需要把本机鼠标的相对增量转发给安卓,而不是光标位置。如果不解耦,会出两个问题:
+     * 1. 增量被"钳"掉:系统光标碰到屏幕边缘就走不动了,此时即使你继续快速甩鼠标,采集到的 kCGMouseEventDeltaX/Y 会变成 0。解耦后光标被"冻结"在屏幕上,物理鼠标怎么甩都能继续产生增量——这正是相对模式"快甩可达任意位置、不困于屏幕矩形"的关键。
+     * 2. 光标乱跑:次屏态下 Mac 本机不该再响应鼠标,如果光标还跟着动,屏幕上会出现一个光标到处乱飞,且我们是要隐藏它的。
+     *
+     */
     CGAssociateMouseAndMouseCursorPosition(false);
     CGDisplayHideCursor(kCGDirectMainDisplay);
 }
 
-// 退出次屏:恢复光标关联 → 移回原位 → 显示。
+// 退出次屏:显示光标 → 恢复光标关联 → 移回原位 → 收回后台光标操作资格。
 void MacCapture::endRemoteCursor() {
+    CGDisplayShowCursor(kCGDirectMainDisplay);
     CGAssociateMouseAndMouseCursorPosition(true);
     CGWarpMouseCursorPosition(savedCursor_);
-    CGDisplayShowCursor(kCGDirectMainDisplay);
+    setCursorHideInBackground(false);
 }
 
 void MacCapture::setControlling(bool on) {
