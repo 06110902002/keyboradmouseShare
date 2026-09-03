@@ -238,9 +238,7 @@ static void setCursorHideInBackground(bool enable) {
 }
 
 void MacCapture::beginRemoteCursor() {
-    CGEventRef e = CGEventCreate(nullptr);
-    savedCursor_ = CGEventGetLocation(e);
-    CFRelease(e);
+    savedCursor_ = getCursorPos();
 
     // 关键:后台进程先取得"后台操作光标"资格,否则下面的隐藏会被系统忽略。
     setCursorHideInBackground(true);
@@ -276,6 +274,18 @@ void MacCapture::setControlling(bool on) {
         endRemoteCursor();
         KMS_INFO("← 返回主屏:恢复本机控制");
     }
+}
+
+CGPoint MacCapture::getCursorPos() const {
+    CGEventRef e = CGEventCreate(nullptr);
+    CGPoint p = CGEventGetLocation(e);
+    CFRelease(e);
+    return p;
+}
+
+CGSize MacCapture::getScreenSize() const {
+    CGRect b = CGDisplayBounds(CGMainDisplayID());
+    return {b.size.width, b.size.height};
 }
 
 } // namespace kms

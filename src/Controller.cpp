@@ -37,6 +37,23 @@ void keepAliveTimerCb(CFRunLoopTimerRef, void *info) {
     static_cast<Controller *>(info)->sendKeepAlive();
 }
 
+// 触发自动切回前,虚拟光标需先"内向"离开返回边的最小像素数。
+// 作用:防止"从返回边进入次屏的那一瞬间"因方向抖动被立刻判定越界而弹回主屏。
+// 取值很小(相对安卓分辨率可忽略),仅用于消除进入瞬间的抖动,不影响正常切回手感。
+constexpr int kReturnArmZone = 24;
+
+// 返回边 = 进入边的对边。安卓摆在 Mac 左侧(edge=left,光标撞 Mac 左边缘进入安卓)时,
+// 安卓的右边缘与 Mac 相邻,故从安卓右边缘向右越出即回到 Mac。其余方向同理镜像。
+Edge oppositeEdge(Edge e) {
+    switch (e) {
+        case Edge::Left:   return Edge::Right;
+        case Edge::Right:  return Edge::Left;
+        case Edge::Top:    return Edge::Bottom;
+        case Edge::Bottom: return Edge::Top;
+        default:           return Edge::None;
+    }
+}
+
 } // namespace
 
 Controller::~Controller() { stop(); }
@@ -80,6 +97,8 @@ void Controller::onClientConnected() {
     heldButtons_.clear();
     androidW_ = cfg_.android_width;
     androidH_ = cfg_.android_height;
+    returnEdge_ = oppositeEdge(cfg_.edge); // 预先算好与 Mac 相邻的返回边
+    returnArmed_ = false;
     // 版本号(1,6):客户端不校验服务端版本、且用固定读取器解析,此处仅作握手标识。
     net_.send(proto::buildHello(1, 6));
     KMS_INFO("已发送 Hello,等待客户端 HelloBack…");
@@ -151,12 +170,41 @@ void Controller::onClientDisconnected() {
 // 主/次屏切换
 // =============================================================================
 
-void Controller::enterRemote() {
+void Controller::enterRemote(bool viaEdge) {
     ++seq_;
-    // CINN:光标进入客户端。相对模式下 x/y 意义不大,给屏幕中心即可。
-    net_.send(proto::buildEnter(clamp16(androidW_ / 2), clamp16(androidH_ / 2), seq_, 0));
-    absX_ = androidW_ / 2;
-    absY_ = androidH_ / 2;
+    CGPoint p = cap_.getCursorPos();
+    float m_w = cap_.getScreenSize().width;
+    float m_h = cap_.getScreenSize().height;
+    double curX_ = p.x;
+    double curY = p.y;
+    double curX_fra = (curX_ + 0.5) / m_w;
+    double curY_fra = (curY + 0.5) / m_h;
+
+    // 进入次屏时给"虚拟光标"设初值 = 固定锚点(方案 B)。
+    // 为什么用固定锚点、而不是"按 Mac 撞边高度比例进入":
+    //   安卓客户端只能相对注入(EV_REL),且系统对注入位移施加【基于速度的指针加速】,
+    //   一次性大增量会被非线性放大 → 无法把光标可靠放到某个绝对比例高度(实测总过冲/落右下角)。
+    //   因此放弃比例进入,改用可预测的固定锚点:落在与 Mac 相邻"返回边"的【竖直中点】。
+    //   返回边所在的那个轴(如右边缘的 x)靠边界钳制到达,与加速无关,精确可靠;
+    //   竖直中点是稳定且对称的选择,进入后继续相对移动、撞回返回边即自动切回。
+    //   热键进入 → 落在屏幕中心。
+    if (viaEdge && returnEdge_ != Edge::None) {
+        switch (returnEdge_) {
+            case Edge::Right:  absX_ = androidW_ - 1; absY_ = androidH_ / 2;  break;
+            case Edge::Left:   absX_ = 0;             absY_ = androidH_ / 2;  break;
+            case Edge::Bottom: absX_ = androidW_ / 2; absY_ = androidH_ - 1;  break;
+            case Edge::Top:    absX_ = androidW_ / 2; absY_ = 0;              break;
+            default:           absX_ = androidW_ / 2; absY_ = androidH_ / 2;  break;
+        }
+    } else {
+        absX_ = androidW_ / 2;
+        absY_ = androidH_ / 2;
+    }
+    returnArmed_ = false; // 进入后需先内向离开返回边 kReturnArmZone 像素才武装,防瞬间弹回
+    // CINN:光标进入客户端。相对模式下坐标意义不大,发送虚拟初值即可。
+    KMS_INFO("当前主屏坐标 x = %f  y = %f,"
+             "进入次屏,虚拟光标=%d,%d   x 比例:%f y 比例:%f", curX_,curY,absX_, absY_,curX_fra, curY_fra);
+    net_.send(proto::buildEnter(clamp16(absX_), clamp16(absY_), seq_, 0));
     onRemote_ = true;                 // 先置位,确保随后采集到的事件会被转发
     cap_.setControlling(true);        // 解耦/隐藏本机光标,开始吞事件
 }
@@ -175,22 +223,60 @@ void Controller::releaseAllHeld() {
     heldButtons_.clear();
 }
 
+// -----------------------------------------------------------------------------
+// 自动切回主屏(模仿 deskflow 绝对模式:光标在次屏累积移动,越过与主屏相邻的边即切回)。
+// 相对模式下客户端不回报光标位置,故服务端用 absX_/absY_ 维护一份"虚拟光标":
+//   * 调用前 absX_/absY_ 已累加本次 delta;
+//   * 只有配置的"返回边"(与 Mac 相邻的一侧)越界才切回,其余三边由调用方夹住(无邻居→不跨越);
+//   * 必须先"武装"(内向离开返回边 kReturnArmZone 像素)才允许触发,避免进入瞬间弹回。
+// 返回 true 表示已调用 leaveRemote(调用方应立即结束本次事件处理)。
+// deskflow 对应逻辑:Server::onMouseMoveSecondary() 的累加 + 方向判定 + switchScreen/夹边。
+// -----------------------------------------------------------------------------
+bool Controller::updateAutoReturn() {
+    const int aw = androidW_, ah = androidH_;
+    int inward;   // 到返回边的"内向"距离(越大 = 越深入次屏)
+    bool crossed; // 是否已越过返回边(与 deskflow 的 m_x>ax+aw-1 等判定一致)
+    switch (returnEdge_) {
+        case Edge::Right:  inward = (aw - 1) - absX_; crossed = absX_ > aw - 1; break;
+        case Edge::Left:   inward = absX_;            crossed = absX_ < 0;      break;
+        case Edge::Bottom: inward = (ah - 1) - absY_; crossed = absY_ > ah - 1; break;
+        case Edge::Top:    inward = absY_;            crossed = absY_ < 0;      break;
+        default:           return false; // 无返回边(edge=none):不自动切回
+    }
+    if (!returnArmed_ && inward >= kReturnArmZone) returnArmed_ = true;
+    if (crossed && returnArmed_) {
+        KMS_INFO("虚拟光标越过返回边 → 自动切回主屏");
+        leaveRemote();
+        return true;
+    }
+    return false;
+}
+
 // =============================================================================
 // MacCaptureDelegate:本机事件 → 协议消息(仅在次屏态转发)
 // =============================================================================
 
 void Controller::onMouseRelative(int dx, int dy) {
     if (!onRemote_) return;
-    if (cfg_.mouse_mode == MouseMode::Relative) {
+
+    // 相对模式:把原始增量直接发给客户端(客户端做相对注入,快甩可达任意位置)。
+    if (cfg_.mouse_mode == MouseMode::Relative)
         net_.send(proto::buildMouseRelMove(clamp16(dx), clamp16(dy)));
-    } else {
-        // 绝对模式:本地累计虚拟坐标并夹到屏内,发 DMMV。
-        absX_ += dx;
-        absY_ += dy;
-        if (absX_ < 0) absX_ = 0; if (absX_ > androidW_ - 1) absX_ = androidW_ - 1;
-        if (absY_ < 0) absY_ = 0; if (absY_ > androidH_ - 1) absY_ = androidH_ - 1;
+
+    // 维护服务端"虚拟光标":相对模式靠它判断何时自动切回主屏;绝对模式还用它作为发送坐标。
+    absX_ += dx;
+    absY_ += dy;
+
+    // 自动切回:虚拟光标越过与 Mac 相邻的"返回边"且已武装 → 回主屏(见 updateAutoReturn)。
+    if (autoReturnActive() && updateAutoReturn()) return;
+
+    // 未触发返回:按 deskflow 方式把虚拟光标夹回屏内(四边都夹,防无界漂移)。
+    if (absX_ < 0) absX_ = 0; else if (absX_ > androidW_ - 1) absX_ = androidW_ - 1;
+    if (absY_ < 0) absY_ = 0; else if (absY_ > androidH_ - 1) absY_ = androidH_ - 1;
+
+    // 绝对模式:发送夹取后的绝对坐标 DMMV。
+    if (cfg_.mouse_mode == MouseMode::Absolute)
         net_.send(proto::buildMouseMove(clamp16(absX_), clamp16(absY_)));
-    }
 }
 
 void Controller::onMouseButton(int cgButton, bool down) {
@@ -237,13 +323,13 @@ void Controller::sendKey(std::uint16_t macKeycode, bool down, bool repeat) {
 }
 
 void Controller::onEdgeHit() {
-    if (state_ == State::Active && !onRemote_) enterRemote();
+    if (state_ == State::Active && !onRemote_) enterRemote(true); // 撞边进入
 }
 
 void Controller::onToggleHotkey() {
     if (state_ != State::Active) return;
     if (onRemote_) leaveRemote();
-    else enterRemote();
+    else enterRemote(false); // 热键进入(落在屏幕中心)
 }
 
 } // namespace kms

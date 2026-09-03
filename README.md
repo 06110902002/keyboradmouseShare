@@ -27,7 +27,15 @@ TCP 连接 → 发 Hello → 收 HelloBack(客户端名)
 
 即跨入 **次屏**(控制安卓):此时本机键鼠事件被"吞掉"并转发给安卓,系统光标被
 解耦冻结并隐藏,鼠标以相对增量(`DMRM`)发送——因此可快速甩到安卓屏幕任意位置。
-再次按热键返回主屏(相对模式下客户端不回报光标位置,返回只能靠热键)。
+
+**返回主屏**有两种方式:
+
+- 再次按**切换热键**;或
+- **撞返回边自动切回**(`auto_return=true`,模仿 deskflow 绝对模式):服务端在次屏期间维护
+  一份"虚拟光标",当它一路移到与 Mac 相邻的**返回边**(即进入边的对边,默认进入边为左、
+  故返回边为安卓右边缘)并越出时,自动切回 Mac——就像两块屏幕左右相邻、光标滑回来一样。
+  相对模式下客户端不回报光标位置,该判定由服务端按累积增量估算;`edge=none` 时此功能失效
+  (无几何布局),仅靠热键返回。
 
 ## 构建
 
@@ -71,6 +79,7 @@ cmake --build build
 | `hotkey` | 切换热键,如 `ctrl+5`、`cmd+space` | `ctrl+5` |
 | `map_command_to_control` | 把 Command 当 Control 发送 | `true` |
 | `mouse_mode` | `relative`(推荐)/ `absolute` | `relative` |
+| `auto_return` | 撞返回边(进入边对边)自动切回主屏 | `true` |
 | `wheel_scale` | 滚轮增量缩放 | `1.0` |
 | `android_width` / `android_height` | 安卓分辨率兜底(握手时会被覆盖) | `1200` / `2670` |
 | `verbose` | 打印 DEBUG 日志 | `false` |

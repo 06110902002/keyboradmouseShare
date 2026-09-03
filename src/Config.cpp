@@ -139,6 +139,8 @@ bool Config::loadFromFile(const std::string &path) {
             if (v == "relative") mouse_mode = MouseMode::Relative;
             else if (v == "absolute") mouse_mode = MouseMode::Absolute;
             else KMS_WARN("mouse_mode 取值无法识别: %s", val.c_str());
+        } else if (key == "auto_return") {
+            auto_return = parseBool(val);
         } else if (key == "wheel_scale") {
             wheel_scale = std::atof(val.c_str());
         } else if (key == "android_width") {
@@ -161,9 +163,10 @@ void Config::logSummary() const {
                           : edge == Edge::Top ? "top" : edge == Edge::Bottom ? "bottom" : "none";
     const char *modeStr = switch_mode == SwitchMode::Edge ? "edge(撞边)" : "hotkey(热键)";
     const char *mouseStr = mouse_mode == MouseMode::Relative ? "relative(相对)" : "absolute(绝对)";
-    KMS_INFO("配置: 端口=%d 跨屏=%s 触发边=%s 鼠标=%s Cmd→Ctrl=%s",
+    KMS_INFO("配置: 端口=%d 跨屏=%s 触发边=%s 鼠标=%s Cmd→Ctrl=%s 自动切回=%s",
              listen_port, modeStr, edgeStr, mouseStr,
-             map_command_to_control ? "是" : "否");
+             map_command_to_control ? "是" : "否",
+             auto_return ? "开" : "关");
 }
 
 } // namespace kms

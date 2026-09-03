@@ -63,6 +63,15 @@ public:
     void setControlling(bool on);
     bool isControlling() const { return controlling_; }
 
+    /**
+     * 获取当前光标位置
+     * @return 返回当前光标位置
+     */
+    CGPoint getCursorPos() const;
+
+    CGSize getScreenSize() const;
+
+
 private:
     // CGEventTap 的 C 回调 → 转发到成员。userInfo 传 this。
     static CGEventRef tapCallback(CGEventTapProxy proxy, CGEventType type,

@@ -47,6 +47,10 @@ struct Config {
     bool map_command_to_control = true;      // 把 Mac 的 Command 映射为 Control(安卓无 Command,
                                              // 且复制/粘贴等在安卓用 Ctrl,更实用)
     MouseMode mouse_mode = MouseMode::Relative; // 默认相对模式
+    bool auto_return = true;                 // 是否启用"撞返回边自动切回主屏"(模仿 deskflow 绝对模式的
+                                             // 自动切回)。返回边 = 进入边(edge)的对边:安卓在 Mac 左侧
+                                             // (edge=left)时,光标在安卓内一路向右撞到安卓右边缘即自动回
+                                             // Mac。edge=none 时该功能自动失效(无几何布局,仅热键切换)。
     double wheel_scale = 1.0;                // 滚轮增量缩放
     int android_width = 1200;                // 安卓宽(兜底;握手时会被客户端 DINF 覆盖)
     int android_height = 2670;               // 安卓高(兜底;同上)
