@@ -130,7 +130,10 @@ void Controller::onFrame(const std::vector<std::uint8_t> &payload) {
         }
         net_.send(proto::buildInfoAck()); // CIAK:应答屏幕信息
         if (!optionsSent_) {
-            // DSOP:开启相对鼠标模式(生产主路径)。收到此帧客户端即完成握手并可接收输入。
+            // DSOP:下发鼠标模式选项。收到此帧客户端即完成握手并可接收输入。
+            //   绝对模式 → 【空选项表】(不发 kOptionRelativeMouseMoves),客户端保持
+            //     默认的绝对语义,移动走 DMMV;
+            //   相对模式 → 发 kOptionRelativeMouseMoves=1,客户端切到 DMRM 相对注入。
             std::vector<std::uint32_t> opts;
             if (cfg_.mouse_mode == MouseMode::Relative)
                 opts = {proto::kOptionRelativeMouseMoves, 1u};
@@ -180,28 +183,41 @@ void Controller::enterRemote(bool viaEdge) {
     double curX_fra = (curX_ + 0.5) / m_w;
     double curY_fra = (curY + 0.5) / m_h;
 
-    // 进入次屏时给"虚拟光标"设初值 = 固定锚点(方案 B)。
-    // 为什么用固定锚点、而不是"按 Mac 撞边高度比例进入":
-    //   安卓客户端只能相对注入(EV_REL),且系统对注入位移施加【基于速度的指针加速】,
-    //   一次性大增量会被非线性放大 → 无法把光标可靠放到某个绝对比例高度(实测总过冲/落右下角)。
-    //   因此放弃比例进入,改用可预测的固定锚点:落在与 Mac 相邻"返回边"的【竖直中点】。
-    //   返回边所在的那个轴(如右边缘的 x)靠边界钳制到达,与加速无关,精确可靠;
-    //   竖直中点是稳定且对称的选择,进入后继续相对移动、撞回返回边即自动切回。
-    //   热键进入 → 落在屏幕中心。
+    // 进入次屏时给"虚拟光标"设初值 = 与 Mac 撞边处【同等比例】的位置(核心特性)。
+    // 该初值随后放进 CINN 发给客户端,客户端在绝对通道上【就落在这个坐标】,零误差。
+    // 前置条件(绝对模式下已满足):
+    //   * 客户端创建了"数位板式绝对定位设备"(Injection.ABSOLUTE_POINTER_ENABLED=true
+    //     且创建成功),EV_ABS 坐标不经过任何指针加速,落点 = 上报值;
+    //   * DINF 上报的是物理真实分辨率(= 绝对设备的值域 [0, 尺寸-1]),故 androidW_/
+    //     androidH_ 与安卓像素一一对应。
+    //   相对模式(mouse_mode=relative)下客户端只能相对注入,落点 = 起点 + 未知增益 ×
+    //   增量,比例必然偏差 —— 这就是默认用绝对模式的原因。
+    // 规则:
+    //   * 返回边在左右(安卓在 Mac 左/右侧)→ 竖直按比例:absY_ = 安卓高 × Mac 竖直比例;
+    //     返回边所在的水平轴(x=0 或 宽-1)靠边界钳制精确到达。
+    //   * 返回边在上下 → 水平按比例:absX_ = 安卓宽 × Mac 水平比例;竖直轴取边界。
+    //   * 热键进入(无撞边处可参照)→ 落屏幕中心。
     if (viaEdge && returnEdge_ != Edge::None) {
+        // 比例 → 像素,并夹到有效范围 [0, dim-1](上限用 dim-1,避免落在 =dim 触发客户端退出信号)。
+        int propX = static_cast<int>(std::lround(androidW_ * curX_fra));
+        int propY = static_cast<int>(std::lround(androidH_ * curY_fra));
+        if (propX < 0) propX = 0; else if (propX > androidW_ - 1) propX = androidW_ - 1;
+        if (propY < 0) propY = 0; else if (propY > androidH_ - 1) propY = androidH_ - 1;
         switch (returnEdge_) {
-            case Edge::Right:  absX_ = androidW_ - 1; absY_ = androidH_ / 2;  break;
-            case Edge::Left:   absX_ = 0;             absY_ = androidH_ / 2;  break;
-            case Edge::Bottom: absX_ = androidW_ / 2; absY_ = androidH_ - 1;  break;
-            case Edge::Top:    absX_ = androidW_ / 2; absY_ = 0;              break;
-            default:           absX_ = androidW_ / 2; absY_ = androidH_ / 2;  break;
+            case Edge::Right:  absX_ = androidW_ - 1; absY_ = propY;         break; // 安卓右边缘,竖直按比例
+            case Edge::Left:   absX_ = 0;             absY_ = propY;         break; // 安卓左边缘,竖直按比例
+            case Edge::Bottom: absY_ = androidH_ - 1; absX_ = propX;         break; // 安卓下边缘,水平按比例
+            case Edge::Top:    absY_ = 0;             absX_ = propX;         break; // 安卓上边缘,水平按比例
+            default:           absX_ = androidW_ / 2; absY_ = androidH_ / 2; break;
         }
     } else {
         absX_ = androidW_ / 2;
         absY_ = androidH_ / 2;
     }
     returnArmed_ = false; // 进入后需先内向离开返回边 kReturnArmZone 像素才武装,防瞬间弹回
-    // CINN:光标进入客户端。相对模式下坐标意义不大,发送虚拟初值即可。
+    // CINN:光标进入客户端,坐标 = 上面按比例算出的落点。
+    // 绝对模式下这一帧就是"按比例进入"生效的地方:客户端 Client.enter() 会用它调用
+    // screen.mouseMove(x,y) → 绝对设备直接落位,与后续流式 DMMV 走【同一条】路径。
     KMS_INFO("当前主屏坐标 x = %f  y = %f,"
              "进入次屏,虚拟光标=%d,%d   x 比例:%f y 比例:%f", curX_,curY,absX_, absY_,curX_fra, curY_fra);
     net_.send(proto::buildEnter(clamp16(absX_), clamp16(absY_), seq_, 0));
@@ -225,7 +241,9 @@ void Controller::releaseAllHeld() {
 
 // -----------------------------------------------------------------------------
 // 自动切回主屏(模仿 deskflow 绝对模式:光标在次屏累积移动,越过与主屏相邻的边即切回)。
-// 相对模式下客户端不回报光标位置,故服务端用 absX_/absY_ 维护一份"虚拟光标":
+// 客户端从不把光标位置回报给服务端(两种鼠标模式都不会),故服务端用 absX_/absY_ 维护
+// 一份"虚拟光标";绝对模式下它同时【就是】下发给客户端的坐标,所以服务端认为的位置与
+// 安卓实际光标位置严格一致 —— 这也让本判定在绝对模式下不会有累积误差。
 //   * 调用前 absX_/absY_ 已累加本次 delta;
 //   * 只有配置的"返回边"(与 Mac 相邻的一侧)越界才切回,其余三边由调用方夹住(无邻居→不跨越);
 //   * 必须先"武装"(内向离开返回边 kReturnArmZone 像素)才允许触发,避免进入瞬间弹回。

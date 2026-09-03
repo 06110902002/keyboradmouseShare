@@ -16,11 +16,15 @@ namespace kms {
 enum class Edge { None, Left, Right, Top, Bottom };
 
 // 跨屏方式:Edge=撞边自动跨越;Hotkey=按热键切换。两种都实现,由此项选默认启用哪种。
-// 注意:相对模式下客户端不会把光标位置回报给服务端,因此"从安卓返回 Mac"总是依赖热键。
+// 注意:客户端(任一鼠标模式)都不会把光标位置回报给服务端,因此"从安卓返回 Mac"
+// 依赖服务端自己维护的虚拟光标越界判定(见 auto_return),热键切换始终可用。
 enum class SwitchMode { Edge, Hotkey };
 
-// 鼠标移动模式:Relative=发相对增量 DMRM(推荐,快甩可达且不困于矩形,已被验证);
-// Absolute=发绝对坐标 DMMV(备用)。
+// 鼠标移动模式:
+//   Absolute=发绝对坐标 DMMV(默认,推荐)。客户端已实现"数位板式绝对定位注入",
+//     落点【就是】本端发出的坐标:按比例进入精确、流式移动无漂移、任意像素可达。
+//   Relative=发相对增量 DMRM(备用/兼容)。客户端只能做相对注入,落点 = 起点 + 系统增益 ×
+//     增量,而该增益依安卓版本/机型而变、不可知,故"按撞边比例进入"必然有偏差。
 enum class MouseMode { Relative, Absolute };
 
 // 自定义修饰键位(自有位定义,避免在纯 C++ 层引入 CoreGraphics 头文件)。
@@ -46,7 +50,7 @@ struct Config {
     Hotkey hotkey{Mod_Control, 0x17};        // 默认切换热键 = Control+5(0x17=kVK_ANSI_5)
     bool map_command_to_control = true;      // 把 Mac 的 Command 映射为 Control(安卓无 Command,
                                              // 且复制/粘贴等在安卓用 Ctrl,更实用)
-    MouseMode mouse_mode = MouseMode::Relative; // 默认相对模式
+    MouseMode mouse_mode = MouseMode::Absolute; // 默认绝对模式(客户端绝对定位注入,精确落位)
     bool auto_return = true;                 // 是否启用"撞返回边自动切回主屏"(模仿 deskflow 绝对模式的
                                              // 自动切回)。返回边 = 进入边(edge)的对边:安卓在 Mac 左侧
                                              // (edge=left)时,光标在安卓内一路向右撞到安卓右边缘即自动回
